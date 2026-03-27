@@ -94,18 +94,18 @@ def result_analysis():
         task_data = []
         for idx in indexs:
             task_data.append(insertlookup_throughput[idx]['lookup'].get(task, 0))
-        ax.bar([x + offset for x in index], task_data, bar_width/2, 
-               label=f'{task} (lookup)' if offset == 0 else "_nolegend_", 
+        ax.bar([x + offset for x in index], task_data, bar_width/2,
+               label=f'{task} (lookup)',
                color=colors[i])
         offset += bar_width/2
-    
+
     # Then plot inserts
     offset = bar_width*2
     for i, task in enumerate(tasks):
         task_data = []
         for idx in indexs:
             task_data.append(insertlookup_throughput[idx]['insert'].get(task, 0))
-        ax.bar([x + offset for x in index], task_data, bar_width/2, 
+        ax.bar([x + offset for x in index], task_data, bar_width/2,
                label=f'{task} (insert)', color=colors[i], hatch='///')
         offset += bar_width/2
     
