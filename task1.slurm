@@ -2,7 +2,7 @@
 #SBATCH --job-name=mikeneuder-task1
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1 --cpus-per-task=1
-#SBATCH --mem=32G
+#SBATCH --mem=128G
 #SBATCH --time=02:00:00             # total run time limit (HH:MM:SS)
 #SBATCH --mail-type=begin,end,fail  # receive email notifications
 #SBATCH --mail-user=mn3265@cs.princeton.edu
