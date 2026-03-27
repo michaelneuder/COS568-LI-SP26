@@ -13,4 +13,5 @@ echo $SLURM_NODELIST
 
 module load anaconda3/2023.3
 
-bash /scratch/network/mn3265/COS568-LI-SP26/scripts/run_all.sh
+cd /scratch/network/mn3265/COS568-LI-SP26
+bash ./scripts/run_benchmarks.sh
