@@ -29,9 +29,9 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
     uint64_t build_time = util::timing([&] {
       lipp_.bulk_load(loading_data.data(), loading_data.size());
-      // Initialize an empty DPGM buffer
-      std::vector<std::pair<KeyType, uint64_t>> empty;
-      pgm_buffer_ = decltype(pgm_buffer_)(empty.begin(), empty.end());
+      // Initialize an empty DPGM buffer (default constructor, not empty range
+      // which triggers log2(0) bug in DynamicPGMIndex)
+      pgm_buffer_ = decltype(pgm_buffer_)();
     });
 
     return build_time;
@@ -115,8 +115,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
     // Reset buffer
     flush_keys_.clear();
-    std::vector<std::pair<KeyType, uint64_t>> empty;
-    pgm_buffer_ = decltype(pgm_buffer_)(empty.begin(), empty.end());
+    pgm_buffer_ = decltype(pgm_buffer_)();
   }
 
   // Mutable because Flush() is called from Insert(), and the benchmark
