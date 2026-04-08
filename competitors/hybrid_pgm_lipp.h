@@ -18,7 +18,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   HybridPGMLIPP(const std::vector<int>& params) {}
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
-    buffer_count_ = 0;
+    flush_keys_.clear();
 
     // Bulk load all initial data into LIPP (the read-optimized store)
     std::vector<std::pair<KeyType, uint64_t>> loading_data;
@@ -45,7 +45,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     }
 
     // Fall back to DPGM buffer
-    if (buffer_count_ > 0) {
+    if (!flush_keys_.empty()) {
       auto it = pgm_buffer_.find(lookup_key);
       if (it != pgm_buffer_.end()) {
         return it->value();
@@ -64,8 +64,8 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       ++lit;
     }
 
-    // Sum from DPGM buffer
-    if (buffer_count_ > 0) {
+    // Sum from DPGM buffer using lower_bound iterator
+    if (!flush_keys_.empty()) {
       auto pit = pgm_buffer_.lower_bound(lower_key);
       while (pit != pgm_buffer_.end() && pit->key() <= upper_key) {
         result += pit->value();
@@ -78,10 +78,10 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
     pgm_buffer_.insert(data.key, data.value);
-    buffer_count_++;
+    flush_keys_.push_back({data.key, data.value});
 
     // Flush buffer into LIPP when threshold is reached
-    if (buffer_count_ >= flush_threshold) {
+    if (flush_keys_.size() >= flush_threshold) {
       Flush();
     }
   }
@@ -108,23 +108,22 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
  private:
   void Flush() const {
-    // Move all entries from DPGM buffer into LIPP
-    auto it = pgm_buffer_.begin();
-    while (it != pgm_buffer_.end()) {
-      lipp_.insert(it->key(), it->value());
-      ++it;
+    // Move all buffered entries into LIPP
+    for (const auto& kv : flush_keys_) {
+      lipp_.insert(kv.first, kv.second);
     }
 
     // Reset buffer
+    flush_keys_.clear();
     std::vector<std::pair<KeyType, uint64_t>> empty;
     pgm_buffer_ = decltype(pgm_buffer_)(empty.begin(), empty.end());
-    buffer_count_ = 0;
   }
 
-  // LIPP and pgm_buffer_ are mutable because Flush() is called from Insert(),
-  // and the benchmark framework passes const references for lookups.
+  // Mutable because Flush() is called from Insert(), and the benchmark
+  // framework may pass const references for lookups.
   mutable LIPP<KeyType, uint64_t> lipp_;
   mutable DynamicPGMIndex<KeyType, uint64_t, SearchClass,
                           PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_buffer_;
-  mutable size_t buffer_count_ = 0;
+  // Side vector tracking buffered keys for flushing, since DynamicPGMIndex::begin() is broken.
+  mutable std::vector<std::pair<KeyType, uint64_t>> flush_keys_;
 };
