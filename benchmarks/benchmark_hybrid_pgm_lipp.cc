@@ -26,12 +26,14 @@ void benchmark_64_hybrid(tli::Benchmark<uint64_t>& benchmark,
 template <int record>
 void benchmark_64_hybrid(tli::Benchmark<uint64_t>& benchmark,
                          const std::string& filename) {
-  // Default sweep: 2 search methods x 3 flush thresholds x 1 pgm_error.
-  // Threshold range covers "frequent flush" (10000), "moderate" (100000),
-  // and "never flush in 200K-insert workload" (1000000).
+  // Default sweep: 2 search methods x 4 flush thresholds x 1 pgm_error.
+  // Threshold range covers "very frequent flush" (1000), "frequent" (10000),
+  // "moderate" (100000), and "never flush in 200K-insert workload" (1000000).
+  benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128, 1000>>();
   benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128, 10000>>();
   benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128, 100000>>();
   benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128, 1000000>>();
+  benchmark.template Run<HybridPGMLIPP<uint64_t, LinearSearch<record>, 128, 1000>>();
   benchmark.template Run<HybridPGMLIPP<uint64_t, LinearSearch<record>, 128, 10000>>();
   benchmark.template Run<HybridPGMLIPP<uint64_t, LinearSearch<record>, 128, 100000>>();
   benchmark.template Run<HybridPGMLIPP<uint64_t, LinearSearch<record>, 128, 1000000>>();
