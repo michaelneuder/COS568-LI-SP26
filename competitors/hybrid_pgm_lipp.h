@@ -213,6 +213,13 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   std::string name() const { return "HYBRID"; }
 
   std::size_t size() const {
+    // size() is called from PrintResult() after DoOps returns. The worker may
+    // still be draining the final flush — wait for it to finish, then take the
+    // LIPP lock to safely read index_size().
+    while (flush_pending_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    std::shared_lock<std::shared_mutex> lipp_lk(lipp_mutex_);
     return lipp_.index_size() + active_->pgm.size_in_bytes()
            + flushing_->pgm.size_in_bytes()
            + active_->bloom.size_in_bytes()
