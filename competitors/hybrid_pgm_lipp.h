@@ -1,7 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
 #include <vector>
 
 #include "../util.h"
@@ -9,8 +15,7 @@
 #include "pgm_index_dynamic.hpp"
 #include "./lipp/src/core/lipp.h"
 
-// Simple counting bloom filter (so we can clear it on flush by resetting the bit array).
-// Uses k=3 hash functions derived from two base hashes via double hashing.
+// Simple bloom filter using double hashing (Murmur3-style mixers).
 template <class KeyType>
 class SimpleBloomFilter {
  public:
@@ -44,7 +49,6 @@ class SimpleBloomFilter {
  private:
   static constexpr int kNumHashes = 3;
 
-  // Two simple hash functions based on multiplicative hashing.
   static uint64_t hash1(uint64_t key) {
     key ^= key >> 33;
     key *= 0xff51afd7ed558ccdULL;
@@ -62,24 +66,55 @@ class SimpleBloomFilter {
   size_t num_bits_;
 };
 
-// Hybrid index: uses DynamicPGM as a write buffer and LIPP as the read-optimized store.
-// A bloom filter sits in front of the DPGM buffer to short-circuit lookups for keys
-// that are definitely not in the buffer (avoiding the DPGM lookup cost).
+// Async double-buffered hybrid index: DPGM is the write buffer, LIPP is the
+// read-optimized store. When the active buffer fills, swap it with a flushing
+// buffer and signal a background thread to drain into LIPP. The main thread
+// keeps inserting into the new (empty) active buffer without blocking.
 //
-// - On insert: key goes into the DPGM buffer + bloom filter.
-// - On lookup: check LIPP first. If miss, check bloom filter — if "not in buffer",
-//              return NOT_FOUND immediately. Otherwise check DPGM.
-// - On flush: bulk-insert all buffered entries into LIPP, reset buffer + bloom filter.
+// Lookups check LIPP, then both buffers (with bloom filters as short-circuits).
 template <class KeyType, class SearchClass, size_t pgm_error, size_t flush_threshold>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
+ private:
+  using PgmType = DynamicPGMIndex<KeyType, uint64_t, SearchClass,
+                                  PGMIndex<KeyType, SearchClass, pgm_error, 16>>;
+
+  struct BufferState {
+    PgmType pgm;
+    SimpleBloomFilter<KeyType> bloom;
+    std::vector<std::pair<KeyType, uint64_t>> keys;
+
+    BufferState() : bloom(flush_threshold * 10) {}
+
+    void clear() {
+      pgm = PgmType();
+      bloom.clear();
+      keys.clear();
+    }
+
+    bool empty() const { return keys.empty(); }
+    size_t size() const { return keys.size(); }
+  };
+
  public:
-  // Bloom filter sized at ~10 bits per expected entry to keep false positive rate low.
   HybridPGMLIPP(const std::vector<int>& params)
-      : bloom_(flush_threshold * 10) {}
+      : active_(std::make_unique<BufferState>()),
+        flushing_(std::make_unique<BufferState>()) {
+    start_worker();
+  }
+
+  ~HybridPGMLIPP() {
+    stop_worker();
+  }
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
-    flush_keys_.clear();
-    bloom_.clear();
+    // Worker should be idle here (Build called once at start of each repeat).
+    // Reset state defensively.
+    {
+      std::unique_lock<std::mutex> lk(swap_mutex_);
+      flush_pending_.store(false, std::memory_order_release);
+      active_->clear();
+      flushing_->clear();
+    }
 
     std::vector<std::pair<KeyType, uint64_t>> loading_data;
     loading_data.reserve(data.size());
@@ -89,42 +124,62 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
     uint64_t build_time = util::timing([&] {
       lipp_.bulk_load(loading_data.data(), loading_data.size());
-      pgm_buffer_ = decltype(pgm_buffer_)();
     });
 
     return build_time;
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
-    // Try LIPP first (fast path)
-    uint64_t value;
-    if (lipp_.find(lookup_key, value)) {
-      return value;
+    // Fast path: LIPP. Shared lock — multiple lookups can proceed in parallel,
+    // but the background flush takes an exclusive lock and blocks lookups.
+    {
+      std::shared_lock<std::shared_mutex> lk(lipp_mutex_);
+      uint64_t value;
+      if (lipp_.find(lookup_key, value)) {
+        return value;
+      }
     }
 
-    // Bloom filter short-circuits the DPGM lookup if the key is definitely not in the buffer.
-    if (!flush_keys_.empty() && bloom_.maybe_contains(lookup_key)) {
-      auto it = pgm_buffer_.find(lookup_key);
-      if (it != pgm_buffer_.end()) {
-        return it->value();
-      }
+    // Check active buffer (no lock — only mutated by main thread in single-
+    // threaded benchmark; bloom filter is cheap and short-circuits negatives).
+    if (!active_->empty() && active_->bloom.maybe_contains(lookup_key)) {
+      auto it = active_->pgm.find(lookup_key);
+      if (it != active_->pgm.end()) return it->value();
+    }
+
+    // Check flushing buffer if a flush is in progress (worker is reading it
+    // but not mutating; safe to read concurrently).
+    if (flush_pending_.load(std::memory_order_acquire) &&
+        !flushing_->empty() && flushing_->bloom.maybe_contains(lookup_key)) {
+      auto it = flushing_->pgm.find(lookup_key);
+      if (it != flushing_->pgm.end()) return it->value();
     }
 
     return util::NOT_FOUND;
   }
 
   uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key, uint32_t thread_id) const {
-    // Bloom filter doesn't help with ranges — always scan both indexes.
     uint64_t result = 0;
-    auto lit = lipp_.lower_bound(lower_key);
-    while (lit != lipp_.end() && lit->comp.data.key <= upper_key) {
-      result += lit->comp.data.value;
-      ++lit;
+    {
+      std::shared_lock<std::shared_mutex> lk(lipp_mutex_);
+      auto lit = lipp_.lower_bound(lower_key);
+      while (lit != lipp_.end() && lit->comp.data.key <= upper_key) {
+        result += lit->comp.data.value;
+        ++lit;
+      }
     }
 
-    if (!flush_keys_.empty()) {
-      auto pit = pgm_buffer_.lower_bound(lower_key);
-      while (pit != pgm_buffer_.end() && pit->key() <= upper_key) {
+    if (!active_->empty()) {
+      auto pit = active_->pgm.lower_bound(lower_key);
+      while (pit != active_->pgm.end() && pit->key() <= upper_key) {
+        result += pit->value();
+        ++pit;
+      }
+    }
+
+    if (flush_pending_.load(std::memory_order_acquire) && !flushing_->empty()) {
+      auto pit = flushing_->pgm.lower_bound(lower_key);
+      while (pit != flushing_->pgm.end() && pit->key() <= upper_key) {
         result += pit->value();
         ++pit;
       }
@@ -134,19 +189,29 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    pgm_buffer_.insert(data.key, data.value);
-    flush_keys_.push_back({data.key, data.value});
-    bloom_.insert(data.key);
+    active_->pgm.insert(data.key, data.value);
+    active_->bloom.insert(data.key);
+    active_->keys.push_back({data.key, data.value});
 
-    if (flush_keys_.size() >= flush_threshold) {
-      Flush();
+    if (active_->size() >= flush_threshold) {
+      // Try to swap. If the previous flush hasn't finished, just keep
+      // accumulating in active_ (back-pressure).
+      std::unique_lock<std::mutex> lk(swap_mutex_);
+      if (!flush_pending_.load(std::memory_order_acquire)) {
+        std::swap(active_, flushing_);
+        flush_pending_.store(true, std::memory_order_release);
+        flush_cv_.notify_one();
+      }
     }
   }
 
   std::string name() const { return "HYBRID"; }
 
   std::size_t size() const {
-    return lipp_.index_size() + pgm_buffer_.size_in_bytes() + bloom_.size_in_bytes();
+    return lipp_.index_size() + active_->pgm.size_in_bytes()
+           + flushing_->pgm.size_in_bytes()
+           + active_->bloom.size_in_bytes()
+           + flushing_->bloom.size_in_bytes();
   }
 
   bool applicable(bool unique, bool range_query, bool insert, bool multithread,
@@ -163,18 +228,63 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   }
 
  private:
-  void Flush() const {
-    for (const auto& kv : flush_keys_) {
-      lipp_.insert(kv.first, kv.second);
-    }
-    flush_keys_.clear();
-    pgm_buffer_ = decltype(pgm_buffer_)();
-    bloom_.clear();
+  void start_worker() {
+    stop_.store(false, std::memory_order_release);
+    flush_pending_.store(false, std::memory_order_release);
+    worker_ = std::thread([this] { worker_loop(); });
   }
 
+  void stop_worker() {
+    {
+      std::lock_guard<std::mutex> lk(swap_mutex_);
+      stop_.store(true, std::memory_order_release);
+      flush_cv_.notify_one();
+    }
+    if (worker_.joinable()) worker_.join();
+  }
+
+  void worker_loop() {
+    while (true) {
+      std::unique_lock<std::mutex> lk(swap_mutex_);
+      flush_cv_.wait(lk, [&] {
+        return stop_.load(std::memory_order_acquire) ||
+               flush_pending_.load(std::memory_order_acquire);
+      });
+      if (stop_.load(std::memory_order_acquire)) return;
+      lk.unlock();
+
+      // Drain flushing_ into LIPP. Take exclusive lock per batch to allow
+      // lookups to interleave between batches.
+      constexpr size_t kBatchSize = 256;
+      size_t i = 0;
+      const size_t n = flushing_->keys.size();
+      while (i < n) {
+        size_t end = std::min(i + kBatchSize, n);
+        {
+          std::unique_lock<std::shared_mutex> lipp_lk(lipp_mutex_);
+          for (; i < end; ++i) {
+            lipp_.insert(flushing_->keys[i].first, flushing_->keys[i].second);
+          }
+        }
+      }
+
+      flushing_->clear();
+      flush_pending_.store(false, std::memory_order_release);
+    }
+  }
+
+  // LIPP store + reader/writer lock.
   mutable LIPP<KeyType, uint64_t> lipp_;
-  mutable DynamicPGMIndex<KeyType, uint64_t, SearchClass,
-                          PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_buffer_;
-  mutable std::vector<std::pair<KeyType, uint64_t>> flush_keys_;
-  mutable SimpleBloomFilter<KeyType> bloom_;
+  mutable std::shared_mutex lipp_mutex_;
+
+  // Double buffer. Pointers are swapped under swap_mutex_.
+  std::unique_ptr<BufferState> active_;
+  std::unique_ptr<BufferState> flushing_;
+  std::mutex swap_mutex_;
+
+  // Background worker.
+  std::thread worker_;
+  std::condition_variable flush_cv_;
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> flush_pending_{false};
 };
