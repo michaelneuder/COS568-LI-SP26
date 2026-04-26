@@ -1,6 +1,6 @@
 #! /usr/bin/env bash
 
-echo "Executing HYBRID benchmarks on mixed workloads..."
+echo "Executing HYBRID, DynamicPGM, and LIPP benchmarks on mixed workloads..."
 
 BENCHMARK=build/benchmark
 if [ ! -f $BENCHMARK ]; then
@@ -20,7 +20,10 @@ mkdir -p ./results
 
 for DATA in fb_100M_public_uint64 books_100M_public_uint64 osmc_100M_public_uint64
 do
-    execute_uint64_100M ${DATA} HYBRID
+for INDEX in HYBRID DynamicPGM LIPP
+do
+    execute_uint64_100M ${DATA} $INDEX
+done
 done
 
 echo "===================Benchmarking complete!===================="
