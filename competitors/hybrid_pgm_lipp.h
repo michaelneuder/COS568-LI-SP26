@@ -130,18 +130,24 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
-    // Fast path: LIPP. Shared lock — multiple lookups can proceed in parallel,
-    // but the background flush takes an exclusive lock and blocks lookups.
-    {
+    // Fast path: LIPP. Skip the lock when no flush is pending — worker is
+    // sleeping and won't touch lipp_. Since the main thread is single-threaded,
+    // flush_pending_ can't transition false→true mid-lookup (only Insert sets
+    // it to true, and Insert can't run concurrently with EqualityLookup).
+    uint64_t value;
+    if (flush_pending_.load(std::memory_order_acquire)) {
       std::shared_lock<std::shared_mutex> lk(lipp_mutex_);
-      uint64_t value;
+      if (lipp_.find(lookup_key, value)) {
+        return value;
+      }
+    } else {
       if (lipp_.find(lookup_key, value)) {
         return value;
       }
     }
 
     // Check active buffer (no lock — only mutated by main thread in single-
-    // threaded benchmark; bloom filter is cheap and short-circuits negatives).
+    // threaded benchmark; bloom filter short-circuits negatives).
     if (!active_->empty() && active_->bloom.maybe_contains(lookup_key)) {
       auto it = active_->pgm.find(lookup_key);
       if (it != active_->pgm.end()) return it->value();
