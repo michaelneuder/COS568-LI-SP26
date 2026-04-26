@@ -26,3 +26,9 @@ echo "Step 5: Running benchmarks..."
 
 echo "=== Benchmark completed successfully ==="
 echo "Check results in the 'results' directory."
+
+
+
+./scripts/create_minimal_cmake.sh
+./scripts/build_benchmark.sh
+./scripts/run_hybrid_benchmarks.sh
