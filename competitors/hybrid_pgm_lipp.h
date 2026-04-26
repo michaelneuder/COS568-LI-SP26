@@ -198,6 +198,11 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       // accumulating in active_ (back-pressure).
       std::unique_lock<std::mutex> lk(swap_mutex_);
       if (!flush_pending_.load(std::memory_order_acquire)) {
+        // Worker is idle; flushing_ holds stale data from the previous flush.
+        // Clear it now (under swap_mutex_) before reusing it as the new active_.
+        // This is safe because flush_pending_ is false, so no lookup will
+        // touch flushing_ concurrently.
+        flushing_->clear();
         std::swap(active_, flushing_);
         flush_pending_.store(true, std::memory_order_release);
         flush_cv_.notify_one();
@@ -254,7 +259,9 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       lk.unlock();
 
       // Drain flushing_ into LIPP. Take exclusive lock per batch to allow
-      // lookups to interleave between batches.
+      // lookups to interleave between batches. Read-only access to flushing_;
+      // we never clear it here — that's the next swap's job (under swap_mutex_)
+      // to avoid use-after-clear races with concurrent lookups.
       constexpr size_t kBatchSize = 256;
       size_t i = 0;
       const size_t n = flushing_->keys.size();
@@ -268,7 +275,6 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
         }
       }
 
-      flushing_->clear();
       flush_pending_.store(false, std::memory_order_release);
     }
   }
