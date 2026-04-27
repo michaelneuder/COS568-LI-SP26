@@ -60,23 +60,36 @@ class SimpleBloomFilter {
   size_t num_bits_;
 };
 
-// Simple hybrid index: DPGM is a write buffer in front of LIPP. A bloom filter
-// short-circuits buffer lookups. When the buffer reaches `flush_threshold`
-// entries, we synchronously drain it into LIPP and reset.
+// Two-phase hybrid index:
 //
-// Flow:
-// - Insert: add to DPGM buffer + bloom + side vector. Flush if threshold hit.
-// - Lookup: check LIPP first; on miss, bloom check + DPGM.find on the buffer.
-// - Flush: iterate the side vector, lipp_.insert each entry, reset buffer.
+//   Phase 1: inserts go into primary_ (DPGM + bloom + side vector for flushing).
+//            On reaching flush_threshold, primary_ is drained into LIPP exactly once.
+//   Phase 2: inserts go into secondary_ (DPGM + bloom). secondary_ is never flushed.
+//
+// Lookups check LIPP, then whichever buffer is active for the current phase
+// (single bloom check per lookup; no extra cost vs single-buffer design).
 template <class KeyType, class SearchClass, size_t pgm_error, size_t flush_threshold>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
+ private:
+  using PgmType = DynamicPGMIndex<KeyType, uint64_t, SearchClass,
+                                  PGMIndex<KeyType, SearchClass, pgm_error, 16>>;
+
+  // Cap bloom at 512 KB so it fits in L2 (1 MiB per core on Adroit).
+  static constexpr size_t kMaxBloomBits = 512ull * 1024 * 8;  // 512 KB
+
  public:
   HybridPGMLIPP(const std::vector<int>& params)
-      : bloom_(std::min<size_t>(flush_threshold * 10, kMaxBloomBits)) {}
+      : primary_bloom_(std::min<size_t>(flush_threshold * 10, kMaxBloomBits)),
+        secondary_bloom_(std::min<size_t>(flush_threshold * 10, kMaxBloomBits)) {
+    // Pre-reserve to avoid reallocations as primary fills toward flush_threshold.
+    primary_keys_.reserve(std::min<size_t>(flush_threshold, 2'000'000ull));
+  }
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
-    flush_keys_.clear();
-    bloom_.clear();
+    is_flushed_ = false;
+    primary_keys_.clear();
+    primary_bloom_.clear();
+    secondary_bloom_.clear();
 
     std::vector<std::pair<KeyType, uint64_t>> loading_data;
     loading_data.reserve(data.size());
@@ -86,7 +99,8 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
     uint64_t build_time = util::timing([&] {
       lipp_.bulk_load(loading_data.data(), loading_data.size());
-      pgm_buffer_ = decltype(pgm_buffer_)();
+      primary_pgm_ = PgmType();
+      secondary_pgm_ = PgmType();
     });
 
     return build_time;
@@ -98,10 +112,17 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       return value;
     }
 
-    if (!flush_keys_.empty() && bloom_.maybe_contains(lookup_key)) {
-      auto it = pgm_buffer_.find(lookup_key);
-      if (it != pgm_buffer_.end()) {
-        return it->value();
+    if (!is_flushed_) {
+      // Phase 1: only primary has data.
+      if (!primary_keys_.empty() && primary_bloom_.maybe_contains(lookup_key)) {
+        auto it = primary_pgm_.find(lookup_key);
+        if (it != primary_pgm_.end()) return it->value();
+      }
+    } else {
+      // Phase 2: primary is drained into LIPP; check secondary.
+      if (secondary_bloom_.maybe_contains(lookup_key)) {
+        auto it = secondary_pgm_.find(lookup_key);
+        if (it != secondary_pgm_.end()) return it->value();
       }
     }
 
@@ -116,9 +137,17 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       ++lit;
     }
 
-    if (!flush_keys_.empty()) {
-      auto pit = pgm_buffer_.lower_bound(lower_key);
-      while (pit != pgm_buffer_.end() && pit->key() <= upper_key) {
+    if (!is_flushed_) {
+      if (!primary_keys_.empty()) {
+        auto pit = primary_pgm_.lower_bound(lower_key);
+        while (pit != primary_pgm_.end() && pit->key() <= upper_key) {
+          result += pit->value();
+          ++pit;
+        }
+      }
+    } else {
+      auto pit = secondary_pgm_.lower_bound(lower_key);
+      while (pit != secondary_pgm_.end() && pit->key() <= upper_key) {
         result += pit->value();
         ++pit;
       }
@@ -128,19 +157,27 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    pgm_buffer_.insert(data.key, data.value);
-    flush_keys_.push_back({data.key, data.value});
-    bloom_.insert(data.key);
+    if (!is_flushed_) {
+      primary_pgm_.insert(data.key, data.value);
+      primary_bloom_.insert(data.key);
+      primary_keys_.push_back({data.key, data.value});
 
-    if (flush_keys_.size() >= flush_threshold) {
-      Flush();
+      if (primary_keys_.size() >= flush_threshold) {
+        Flush();
+        is_flushed_ = true;
+      }
+    } else {
+      secondary_pgm_.insert(data.key, data.value);
+      secondary_bloom_.insert(data.key);
     }
   }
 
   std::string name() const { return "HYBRID"; }
 
   std::size_t size() const {
-    return lipp_.index_size() + pgm_buffer_.size_in_bytes() + bloom_.size_in_bytes();
+    return lipp_.index_size()
+           + primary_pgm_.size_in_bytes() + primary_bloom_.size_in_bytes()
+           + secondary_pgm_.size_in_bytes() + secondary_bloom_.size_in_bytes();
   }
 
   bool applicable(bool unique, bool range_query, bool insert, bool multithread,
@@ -157,25 +194,29 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   }
 
  private:
-  // Cap bloom at 512 KB so it fits in L2 (1 MiB per core on Adroit).
-  // At threshold=1M, 10 bits/element would be 1.25 MB and overflow L2.
-  static constexpr size_t kMaxBloomBits = 512ull * 1024 * 8;  // 512 KB
-
   void Flush() const {
-    for (const auto& kv : flush_keys_) {
+    for (const auto& kv : primary_keys_) {
       lipp_.insert(kv.first, kv.second);
     }
-    flush_keys_.clear();
-    pgm_buffer_ = decltype(pgm_buffer_)();
-    bloom_.clear();
+    primary_keys_.clear();
+    primary_pgm_ = PgmType();
+    primary_bloom_.clear();
   }
 
-  // Mutable because Flush() is called from Insert(), and the benchmark
+  // Mutable because Flush() is called from Insert() and the benchmark
   // framework may pass const references for lookups.
   mutable LIPP<KeyType, uint64_t> lipp_;
-  mutable DynamicPGMIndex<KeyType, uint64_t, SearchClass,
-                          PGMIndex<KeyType, SearchClass, pgm_error, 16>> pgm_buffer_;
-  // Side vector tracking buffered keys for flushing (DynamicPGMIndex::begin() is broken).
-  mutable std::vector<std::pair<KeyType, uint64_t>> flush_keys_;
-  mutable SimpleBloomFilter<KeyType> bloom_;
+
+  // Primary buffer (Phase 1): receives all inserts up to flush_threshold,
+  // then drained to LIPP exactly once.
+  mutable PgmType primary_pgm_;
+  mutable SimpleBloomFilter<KeyType> primary_bloom_;
+  mutable std::vector<std::pair<KeyType, uint64_t>> primary_keys_;
+
+  // Secondary buffer (Phase 2): receives all inserts after the one flush.
+  // Never flushed — accumulates until destruction.
+  mutable PgmType secondary_pgm_;
+  mutable SimpleBloomFilter<KeyType> secondary_bloom_;
+
+  mutable bool is_flushed_ = false;
 };
