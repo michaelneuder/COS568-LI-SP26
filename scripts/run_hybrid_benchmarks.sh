@@ -16,7 +16,7 @@ function execute_uint64_100M() {
     $BENCHMARK ./data/$1 ./data/$1_ops_2M_0.000000rq_0.500000nl_0.100000i_0m_mix --through --csv --only $2 -r 3
 }
 
-mkdir -p ./results
+mkdir -p ./results2
 
 for DATA in fb_100M_public_uint64 books_100M_public_uint64 osmc_100M_public_uint64
 do
