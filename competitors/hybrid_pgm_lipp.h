@@ -83,7 +83,10 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     SimpleBloomFilter<KeyType> bloom;
     std::vector<std::pair<KeyType, uint64_t>> keys;
 
-    BufferState() : bloom(flush_threshold * 10) {}
+    // Cap bloom at 512 KB so it fits in L2 (1 MiB per core on Adroit).
+    // At threshold=1M, 10 bits/element would be 1.25 MB and overflow L2.
+    static constexpr size_t kMaxBloomBits = 512ull * 1024 * 8;  // 512 KB
+    BufferState() : bloom(std::min<size_t>(flush_threshold * 10, kMaxBloomBits)) {}
 
     void clear() {
       pgm = PgmType();
