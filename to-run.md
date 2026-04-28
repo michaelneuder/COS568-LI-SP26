@@ -1,0 +1,3 @@
+create_minimal_cmake.sh
+
+build_benchmark.sh
